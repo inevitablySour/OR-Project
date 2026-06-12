@@ -76,15 +76,37 @@ class ZoneSpec:
 
 
 # Default 4-zone topology from Section 22.1
+# Lowlands has ONE entrance plaza (~28 turnstile lanes total, see ENTRANCE_LANES below).
+# Inside the festival there are no internal gates -- zones are connected by open
+# space, and crowd movement between them is governed purely by the density-gradient
+# flow m_z(t) scaled by the shared boundary width (Section 22, "Inter-Zone Movement").
+# Lowlands has TWO entrances: a main entrance (30-40 scanners) and a smaller
+# secondary entrance (20-25 scanners). Using midpoints: main=35, secondary=22.5 -> 22.
+ENTRANCE_LANES = {"main": 35, "secondary": 22}
+_total_lanes = sum(ENTRANCE_LANES.values())
+ENTRANCE_SHARE = {name: n / _total_lanes for name, n in ENTRANCE_LANES.items()}  # 35/57, 22/57
+ENTRANCE_AREA_M2 = {"main": 2000.0, "secondary": 1200.0}
+
 DEFAULT_ZONES: Dict[str, ZoneSpec] = {
-    "main_stage":   ZoneSpec("main_stage",   14000, n_gates=2, exit_width_m=35, arrival_share=0.431,
+    "main_stage":   ZoneSpec("main_stage",   14000, n_gates=0, exit_width_m=35, arrival_share=0.431,
                               v_z=112, adjacent=("second_stage", "food_court", "camping")),
-    "second_stage": ZoneSpec("second_stage",  8000, n_gates=1, exit_width_m=15, arrival_share=0.246,
+    "second_stage": ZoneSpec("second_stage",  8000, n_gates=0, exit_width_m=15, arrival_share=0.246,
                               v_z=64,  adjacent=("main_stage", "food_court")),
-    "food_court":   ZoneSpec("food_court",    6000, n_gates=1, exit_width_m=12, arrival_share=0.185,
+    "food_court":   ZoneSpec("food_court",    6000, n_gates=0, exit_width_m=12, arrival_share=0.185,
                               v_z=49,  adjacent=("main_stage", "second_stage", "camping")),
-    "camping":      ZoneSpec("camping",       4500, n_gates=1, exit_width_m=18, arrival_share=0.138,
+    "camping":      ZoneSpec("camping",       4500, n_gates=0, exit_width_m=18, arrival_share=0.138,
                               v_z=36,  adjacent=("main_stage", "food_court")),
+}
+
+# Shared boundary widths W_{z,z'} (metres) for open-area inter-zone flow.
+# Used in place of A_min(z,z') so movement is governed by the width of the
+# connecting space, not the smaller zone's total area.
+BOUNDARY_WIDTH_M = {
+    frozenset({"main_stage", "second_stage"}): 60.0,
+    frozenset({"main_stage", "food_court"}): 80.0,
+    frozenset({"main_stage", "camping"}): 50.0,
+    frozenset({"second_stage", "food_court"}): 40.0,
+    frozenset({"food_court", "camping"}): 45.0,
 }
 
 
@@ -109,16 +131,37 @@ def sample_incidents(a_z: float, weather: str, dt_hours: float, rng: np.random.G
 # ZONE RUNTIME STATE
 # ============================================================
 
+# Queue tolerance thresholds (Section 21 "Queue Tolerance Thresholds: Gate vs Internal")
+SIGMA_V = 12.0 / 60.0   # vendor service rate, orders/min/stall (12/hr)
+G_BASE_PER_MIN = 400.0 / 60.0  # gate base throughput, scans/min
+
+Q_MAX_VENDOR = SIGMA_V * 10.0   # ~10 min-equivalent queue length per stall -> threshold = v_z * Q_MAX_VENDOR
+Q_MAX_GATE = G_BASE_PER_MIN * 50.0  # ~50 min-equivalent queue length -> triggers surge
+
+
+@dataclass
+class EntranceState:
+    name: str
+    q: float = 0.0  # shared entrance queue (Section 22)
+
+
 @dataclass
 class ZoneState:
     spec: ZoneSpec
     a: float = 0.0          # current occupancy a_z(t)
     q_gate: float = 0.0     # gate queue q_i(t), aggregated across this zone's gates
+    q_vendor: float = 0.0   # vendor queue q_z(t), Section 21
+    surge_active: bool = False
+    extra_stalls: int = 0
     incidents_cum: Dict[str, int] = field(default_factory=lambda: {"minor": 0, "moderate": 0, "critical": 0})
 
     @property
     def density(self) -> float:
         return self.a / self.spec.area_m2
+
+    @property
+    def v_z_effective(self) -> int:
+        return self.spec.v_z + self.extra_stalls
 
 
 # ============================================================
@@ -184,6 +227,7 @@ def run_festival_once(
     rng = np.random.default_rng(seed if seed is not None else scenario.seed)
 
     states = {name: ZoneState(spec) for name, spec in zones.items()}
+    entrances = {name: EntranceState(name) for name in ENTRANCE_LANES}
     weather = draw_initial_weather(rng)
     no_show = NOSHOW_BY_WEATHER[weather]
     a_eff_total = scenario.a_total * (1 - no_show)
@@ -204,31 +248,54 @@ def run_festival_once(
     for t in range(scenario.horizon_steps):
         d_max_w = D_MAX_BY_WEATHER[weather]
         amax_now = a_max(zones, weather, scenario.t_evac_min)
+        entrance_surge = False
 
         if evacuated:
             for st in states.values():
                 st.a = 0.0
         else:
-            # --- gate arrivals into each zone, proportional to arrival_share ---
+            # --- two shared entrance gates (Section 22: main + secondary) ---
             step_inflow_total = a_eff_total * arrival_fraction[t]
-            for name, st in states.items():
-                inflow = step_inflow_total * st.spec.arrival_share
-                # policy rule: halt entry if zone density >= theta_warn * D_max (Section 11)
-                if st.density >= 0.85 * d_max_w:
-                    st.q_gate += inflow
-                else:
-                    admit = min(inflow + st.q_gate, max(0.0, 0.85 * d_max_w * st.spec.area_m2 - st.a))
-                    st.q_gate = max(0.0, inflow + st.q_gate - admit)
-                    st.a += admit
+            total_admitted = 0.0
+            entrance_surges = {}
+            for ename, ent in entrances.items():
+                ent.q += step_inflow_total * ENTRANCE_SHARE[ename]
+                n_lanes = ENTRANCE_LANES[ename]
+                surge = ent.q > Q_MAX_GATE * n_lanes
+                entrance_surges[ename] = surge
+                g_eff = G_BASE_PER_MIN * n_lanes
+                if surge:
+                    g_eff *= 1.6  # +60% per Section 22.6
+                admitted = min(ent.q, g_eff * scenario.dt_hours * 60)
+                ent.q = max(0.0, ent.q - admitted)
+                total_admitted += admitted
+            entrance_surge = any(entrance_surges.values())
 
-            # --- inter-zone movement m_z(t): density-gradient flow ---
+            # dispersal into the open-area zones, proportional to arrival_share
+            # (no internal gates -- people walk in and head toward their zone)
+            for name, st in states.items():
+                st.a += total_admitted * st.spec.arrival_share
+
+            # --- vendor queue q_z(t), Section 21 ---
+            for st in states.values():
+                demand = rng.poisson(0.25 / 60.0 * st.a * scenario.dt_hours * 60)
+                served = st.v_z_effective * SIGMA_V * scenario.dt_hours * 60
+                st.q_vendor = max(0.0, st.q_vendor + demand - served)
+                # "add vendor stalls" trigger: q_z/v_z > Q_MAX_VENDOR/v_z, i.e. q_z > Q_MAX_VENDOR
+                if st.q_vendor > Q_MAX_VENDOR * st.v_z_effective:
+                    st.extra_stalls += 1
+
+            # --- inter-zone movement m_z(t): open-area density-gradient flow,
+            #     scaled by the WIDTH of the connecting space (Section 22) ---
             moves = {name: 0.0 for name in states}
             for name, st in states.items():
                 for nbr in st.spec.adjacent:
                     nbr_st = states[nbr]
                     grad = st.density - nbr_st.density
                     if grad > 0:
-                        flow = scenario.kappa_m * grad * min(st.spec.area_m2, nbr_st.spec.area_m2)
+                        width = BOUNDARY_WIDTH_M.get(frozenset({name, nbr}), 0.0)
+                        # flow ~ gradient x boundary width x flow coefficient
+                        flow = scenario.kappa_m * grad * width * 50.0
                         moves[name] -= flow
                         moves[nbr] += flow
             for name, st in states.items():
@@ -258,7 +325,8 @@ def run_festival_once(
         for name, st in states.items():
             zone_rows.append({
                 "t": t, "zone": name, "a_z": st.a, "density": st.density,
-                "q_gate": st.q_gate,
+                "q_gate": st.q_gate, "q_vendor": st.q_vendor,
+                "surge_active": st.surge_active, "extra_stalls": st.extra_stalls,
                 "minor": st.incidents_cum["minor"],
                 "moderate": st.incidents_cum["moderate"],
                 "critical": st.incidents_cum["critical"],
@@ -267,6 +335,9 @@ def run_festival_once(
         fest_rows.append({
             "t": t, "weather": weather, "V": V, "nu": nu,
             "A_max": amax_now, "total_a": sum(st.a for st in states.values()),
+            "entrance_q": sum(e.q for e in entrances.values()),
+            "entrance_density": sum(e.q / ENTRANCE_AREA_M2[n] for n, e in entrances.items()) / len(entrances),
+            "entrance_surge": entrance_surge,
             "evacuated": evacuated,
         })
 
@@ -292,7 +363,8 @@ def aggregate_run(
     R = p * timeline["total_a"].iloc[-1] / 1000.0  # (EUR thousands)
     C = (timeline["weather"].map(COST_MULT_BY_WEATHER) * (omega_z_total / 1000.0)).mean()
     D = zone_timeline["density"].max()
-    Q = (zone_timeline["q_gate"] / zone_timeline["zone"].map(lambda z: DEFAULT_ZONES[z].v_z)).max()
+    Q = (zone_timeline["q_vendor"] /
+         zone_timeline.apply(lambda r: DEFAULT_ZONES[r["zone"]].v_z + r["extra_stalls"], axis=1)).max()
 
     minor = zone_timeline.groupby("zone")["minor"].max().sum()
     moderate = zone_timeline.groupby("zone")["moderate"].max().sum()
