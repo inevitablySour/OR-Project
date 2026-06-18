@@ -368,41 +368,63 @@ ENTRANCE_SHARE   = {n: v / _total_lanes for n, v in ENTRANCE_LANES.items()}
 ENTRANCE_AREA_M2 = {"main": 2000.0, "secondary": 1200.0}
 
 DEFAULT_ZONES: Dict[str, ZoneSpec] = {
-    # Alpha: main stage tent + surrounding standing area
-    # Arrival share ~43% (largest draw at headliner time)
-    # Exit width proportional: 43% of 929m ≈ 400m
-    # v_z=113: ceil(28,015 / 250) per V_max constraint
+    # Alpha: main stage zone
+    # Gross area ~28,000 m² — infrastructure deducted:
+    #   Stage deck + production (40% of 7,140m² tent): 2,850 m²
+    #   Backstage compound (fenced artist/crew area):   1,500 m²
+    #   FOH mixing tower + exclusion zone:                300 m²
+    #   Crush barrier zone (5m deep front of stage):      500 m²
+    #   Toilets, first aid post, access paths:           1,200 m²
+    # Usable crowd area: 21,650 m² (77% of gross)
+    # Exit width: 43% of 929m total ≈ 400m
+    # v_z=113: ceil(21,650 × 0.431 × 65000/78850 / 250)
     "alpha_main_stage": ZoneSpec(
-        "alpha_main_stage", area_m2=28000, n_gates=0,
+        "alpha_main_stage", area_m2=21650, n_gates=0,
         exit_width_m=400, arrival_share=0.431, v_z=113,
         adjacent=("cape_lowlands", "planet_paradise")),
 
-    # Cape Lowlands: Bravo + smaller southern stages (India, X-Ray, Hacienda)
-    # ~25% of crowd at any time
+    # Cape Lowlands: Bravo + India + X-Ray + Hacienda + ArmadiLLow (5 stages)
+    # Gross area ~42,000 m² — infrastructure deducted:
+    #   Bravo stage + production (40% of ~5,000m² tent):  2,000 m²
+    #   India stage + production (40% of ~2,500m² tent):  1,000 m²
+    #   3 smaller stages (X-Ray, Hacienda, ArmadiLLow):   1,800 m²
+    #   Backstage compounds (5 stages × ~600m²):          3,000 m²
+    #   Walkways, toilets, service paths between stages:   3,500 m²
+    # Usable crowd area: 30,700 m² (73% of gross)
     # Exit width: 25% of 929m ≈ 232m
-    # v_z=64: ceil(15,990 / 250)
+    # v_z=64: ceil(30,700 × 0.246 × 65000/78850 / 250)
     "cape_lowlands": ZoneSpec(
-        "cape_lowlands", area_m2=42000, n_gates=0,
+        "cape_lowlands", area_m2=30700, n_gates=0,
         exit_width_m=232, arrival_share=0.246, v_z=64,
         adjacent=("alpha_main_stage", "camping")),
 
-    # Planet Paradise: Heineken stage + food village (centre of site)
-    # ~19% of crowd — BUT food zone serves the whole festival so gets 2.5x stalls
+    # Planet Paradise: Heineken + Lima + Echo + Juliet + food village
+    # Gross area ~35,000 m² — infrastructure deducted:
+    #   Heineken stage + production (40% of ~3,000m²):    1,200 m²
+    #   3 smaller stages (Lima, Echo, Juliet):             1,800 m²
+    #   Food vendor back-of-house (~200 stalls × 15m²):   3,000 m²
+    #   Paths, toilets, art installations (non-walkable):  2,500 m²
+    # Usable crowd area: 26,500 m² (76% of gross)
     # Exit width: 19% of 929m ≈ 177m
-    # v_z=122: food hub premium (serves adjacent zones too)
+    # v_z=122: food hub premium — serves adjacent zones too (2.5× base)
     "planet_paradise": ZoneSpec(
-        "planet_paradise", area_m2=35000, n_gates=0,
+        "planet_paradise", area_m2=26500, n_gates=0,
         exit_width_m=177, arrival_share=0.185, v_z=122,
         adjacent=("alpha_main_stage", "cape_lowlands", "camping")),
 
     # Camping: 7 sections (lowlands.nl/camping; Ticketmaster UK official)
     # "Virtually all 65,000 visitors camp overnight" (maxiaxi.com 2025)
     # Area: 65,000 × ~4.2 m²/person pitch ≈ 273,000 m² (27.3 ha) across 7 sections
-    # Fewer vendor stalls — campers self-cater; camping bars serve drinks only
+    # Note: 4.2 m²/person already represents usable tent pitch space —
+    #       no infrastructure deduction needed (paths/showers excluded from pitch density)
+    # Population modelled as EXOGENOUS SCHEDULE (wristband checkpoint separates
+    # camping from festival terrain — people do not flow via density gradient)
     # Exit width: 120m to car parks / shuttle buses (separate from festival exits)
+    # v_z=25: fewer stalls — campers self-cater; camping bars serve drinks only
     "camping": ZoneSpec(
         "camping", area_m2=273000, n_gates=0,
-        exit_width_m=120, arrival_share=0.138, v_z=25,
+        exit_width_m=120, arrival_share=0.0,  # camping receives NO gate arrivals
+        v_z=25,
         adjacent=("cape_lowlands", "planet_paradise")),
 }
 
@@ -616,6 +638,43 @@ def run_festival_once(
     departure_fraction = build_departure_fraction(scenario.horizon_steps, scenario.dt_hours,
                                                   day=scenario.day)
 
+    # ── Camping population model ────────────────────────────────────────────
+    # Camping is physically separated from festival terrain by a wristband
+    # checkpoint. People do NOT receive arrivals into camping through the main
+    # gate, and do NOT flow between camping and festival zones via density
+    # gradient. Instead the camping population follows a daily schedule:
+    #
+    #   Morning (t=0–8, 10:00–12:00): campers wake and walk to festival terrain.
+    #     ~95% of campers cross to festival by midday (sigmoid morning outflow).
+    #   Afternoon/Evening (t=8–48): small residual in camping (resting, etc).
+    #   Night (t=48–64, 22:00–02:00): people trickle back to camping after shows.
+    #     On Sunday (last day): no evening return — full exodus instead.
+    #
+    # camping_fraction from FestivalType: for Lowlands camping_sellout = 0.95
+    camping_fraction = scenario.festival_type.camping_fraction
+    n_campers        = a_eff_total * camping_fraction
+    n_daytrippers    = a_eff_total * (1.0 - camping_fraction)
+
+    _ts = np.arange(scenario.horizon_steps, dtype=float)
+    _morning_out = 1.0 / (1.0 + np.exp(-0.8 * (_ts - 6)))   # sigmoid: half by t=6 (11:30)
+    _evening_in  = 1.0 / (1.0 + np.exp( 0.6 * (_ts - 50)))  # return from t=50 (22:30)
+    camper_on_festival = np.clip(_morning_out - (1.0 - _evening_in) * 0.85, 0.05, 0.95)
+    if scenario.day == 3:  # Sunday: no evening return, full exodus
+        camper_on_festival = np.clip(_morning_out, 0.05, 0.95)
+
+    # Festival terrain zones only (camping excluded from all arrival/flow/departure)
+    festival_zone_names = [n for n in zones if n != "camping"]
+    total_festival_share = sum(zones[n].arrival_share for n in festival_zone_names)
+    festival_arrival_share = {
+        n: zones[n].arrival_share / total_festival_share
+        for n in festival_zone_names
+    }
+
+    # Pre-build camping population time series (exogenous, schedule-driven)
+    camping_pop = np.zeros(scenario.horizon_steps)
+    for t in range(scenario.horizon_steps):
+        camping_pop[t] = n_campers * (1.0 - camper_on_festival[t])
+
     # Time-varying vendor demand multiplier: meal peaks at lunch (t≈12) and dinner (t≈28)
     # Base RHO_V is the average; peaks are ~2.5x the off-peak rate.
     # Steps: t=0 → 10:00, t=8 → 12:00 (lunch), t=28 → 17:00, t=32 → 18:00 (dinner)
@@ -636,6 +695,10 @@ def run_festival_once(
             for st in states.values():
                 st.a = 0.0
         else:
+            # ── camping: set exogenously from schedule ──────────────
+            # Wristband checkpoint — not connected to gate arrivals or gradient flow
+            states["camping"].a = camping_pop[t]
+
             # ── shared entrance queue (main + secondary) ───────────
             step_in = a_eff_total * arrival_fraction[t]
             total_admitted = 0.0
@@ -643,7 +706,6 @@ def run_festival_once(
             for en, ent in entrances.items():
                 ent.q += step_in * ENTRANCE_SHARE[en]
                 nl    = ENTRANCE_LANES[en]
-                # FIX 7: surge threshold is per-entrance total, not per-lane
                 surge = ent.q > Q_MAX_GATE
                 surge_map[en] = surge
                 g_eff    = G_BASE_PER_MIN * nl * (1.6 if surge else 1.0)
@@ -653,19 +715,17 @@ def run_festival_once(
             entrance_surge = any(surge_map.values())
             total_ever_admitted += total_admitted
 
-            # Dispersal to zones by arrival_share (no internal gates)
-            for n, st in states.items():
-                st.a += total_admitted * st.spec.arrival_share
+            # Dispersal to FESTIVAL TERRAIN ZONES ONLY (not camping)
+            for n in festival_zone_names:
+                states[n].a += total_admitted * festival_arrival_share[n]
 
-            # ── departures: people leave proportional to zone occupancy ──
-            # departure_fraction[t] is the fraction of total admitted
-            # who leave this step (Research: post-headliner exodus)
-            total_a_now = sum(st.a for st in states.values())
-            departures_this_step = total_a_now * departure_fraction[t]
-            if total_a_now > 0:
-                for st in states.values():
-                    zone_share = st.a / total_a_now
-                    st.a = max(0.0, st.a - departures_this_step * zone_share)
+            # ── departures from festival terrain only ───────────────
+            festival_a_now = sum(states[n].a for n in festival_zone_names)
+            departures_this_step = festival_a_now * departure_fraction[t]
+            if festival_a_now > 0:
+                for n in festival_zone_names:
+                    zone_share = states[n].a / festival_a_now
+                    states[n].a = max(0.0, states[n].a - departures_this_step * zone_share)
 
             # ── vendor queues (Section 21) ─────────────────────────
             # RHO_V * vendor_mult[t] gives time-varying demand:
@@ -677,18 +737,22 @@ def run_festival_once(
                 if st.q_vendor > Q_MAX_VENDOR * st.v_z_effective:
                     st.extra_stalls += 1
 
-            # ── inter-zone movement: boundary-width-scaled gradient ─
-            moves = {n: 0.0 for n in states}
-            for n, st in states.items():
+            # ── inter-zone movement: festival terrain only ──────────
+            # Camping excluded — wristband checkpoint prevents gradient flow
+            moves = {n: 0.0 for n in festival_zone_names}
+            for n in festival_zone_names:
+                st = states[n]
                 for nbr in st.spec.adjacent:
+                    if nbr not in festival_zone_names:
+                        continue
                     grad = st.density - states[nbr].density
                     if grad > 0:
                         width = BOUNDARY_WIDTH_M.get(frozenset({n, nbr}), 0.0)
                         flow  = scenario.kappa_m * grad * width * 50.0
                         moves[n]   -= flow
                         moves[nbr] += flow
-            for n, st in states.items():
-                st.a = max(0.0, st.a + moves[n])
+            for n in festival_zone_names:
+                states[n].a = max(0.0, states[n].a + moves[n])
 
             # ── incidents (Section 17 / 22.9) ──────────────────────
             for st in states.values():
@@ -696,11 +760,12 @@ def run_festival_once(
                 for k, v in inc.items():
                     st.incidents_cum[k] += v
 
-            # ── violations (FIX 6: single combined flag per step) ───
-            total_a      = sum(st.a for st in states.values())
-            density_ok   = all(st.density <= d_max_w for st in states.values())
-            capacity_ok  = total_a <= amax_now
-            # Count as one violation if ANY constraint breached this step
+            # ── violations: festival terrain only ───────────────────
+            # Camping excluded — separately managed, low density by design
+            fest_a_tot = sum(states[n].a for n in festival_zone_names)
+            total_a    = sum(st.a for st in states.values())
+            density_ok = all(states[n].density <= d_max_w for n in festival_zone_names)
+            capacity_ok = fest_a_tot <= amax_now
             if not density_ok or not capacity_ok:
                 V += 1
 
@@ -713,8 +778,12 @@ def run_festival_once(
                 evacuated = True
 
         # ── log ────────────────────────────────────────────────────
-        total_a_now = sum(st.a for st in states.values())
-        peak_occupancy = max(peak_occupancy, total_a_now)
+        # total_a_now  = everyone on site (festival + camping)
+        # festival_a   = festival terrain only (safety-relevant for density/capacity)
+        # peak_occupancy tracks festival terrain peak only
+        total_a_now  = sum(st.a for st in states.values())
+        festival_a   = sum(states[n].a for n in festival_zone_names)
+        peak_occupancy = max(peak_occupancy, festival_a)
         for n, st in states.items():
             zone_rows.append({
                 "t": t, "zone": n,
@@ -726,7 +795,9 @@ def run_festival_once(
             })
         fest_rows.append({
             "t": t, "weather": weather, "V": V, "nu": nu,
-            "A_max": amax_now, "total_a": total_a_now,
+            "A_max": amax_now,
+            "total_a":      total_a_now,    # everyone on site incl. camping
+            "festival_a":   festival_a,     # festival terrain only (safety-relevant)
             "entrance_q":          sum(e.q for e in entrances.values()),
             "entrance_surge":      entrance_surge,
             "evacuated":           evacuated,
