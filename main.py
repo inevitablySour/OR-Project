@@ -26,14 +26,14 @@ FIXES applied vs earlier versions:
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+import math
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.ticker as mticker
 
-from or_des_toolkit_week6 import QueueScenario  # kept for compatibility
 
 
 # ============================================================
@@ -68,6 +68,10 @@ plt.rcParams.update({
 
 ZONE_COLOURS    = {"alpha_main_stage": "#4FC3F7", "cape_lowlands": "#FFB74D",
                    "planet_paradise":  "#81C784", "camping":       "#CE93D8"}
+_DEFAULT_COLOURS = ["#4FC3F7", "#FFB74D", "#81C784", "#CE93D8", "#F48FB1", "#80CBC4"]
+
+def _zone_colour(zone_name: str, idx: int) -> str:
+    return ZONE_COLOURS.get(zone_name, _DEFAULT_COLOURS[idx % len(_DEFAULT_COLOURS)])
 WEATHER_COLOURS = {"clear": "#FFE082", "rain": "#64B5F6", "heat": "#EF9A9A"}
 ALT_COLOURS     = {"A1": "#78909C", "A2": "#4DB6AC", "A3": "#FF8A65", "A4": "#BA68C8"}
 ACCENT  = "#7C83FD"
@@ -86,7 +90,20 @@ T_WEATHER = np.array([
     [0.08, 0.91, 0.01],
     [0.05, 0.02, 0.93],
 ])
-D_MAX_BY_WEATHER     = {"clear": 2.0, "rain": 1.7, "heat": 1.5}
+# Density thresholds (all values are zone-level spatial averages: total people / usable m²).
+# Zone averages map to local front-of-stage densities roughly 2.5× higher.
+#
+# D_MAX_BY_WEATHER — Purple Guide permit standard (unchanged). Used for A_max /
+#                    ticket capacity calculations only. Do NOT use for violation checks.
+# THETA_WARN       — zone avg 1.5 ≈ local front ~3.5 p/m²: normal dense festival.
+#                    Fires a soft warning; does NOT increment V(t).
+# THETA_VIOLATION  — zone avg 1.8 ≈ local front ~4.5 p/m²: intervention required.
+#                    Increments V(t). Relaxed to D_MAX_PERFORMANCE during scheduled acts.
+D_MAX_BY_WEATHER         = {"clear": 2.0, "rain": 1.7, "heat": 1.5}
+THETA_WARN               = {"clear": 1.5, "rain": 1.3, "heat": 1.1}
+THETA_VIOLATION          = {"clear": 1.8, "rain": 1.5, "heat": 1.3}
+D_MAX_PERFORMANCE        = {"clear": 4.0, "rain": 3.2, "heat": 2.8}
+PERFORMANCE_WINDOW_STEPS = 4   # ±4 steps (±1 hour) around each scheduled act
 PHI_BY_WEATHER       = {"clear": 82.0, "rain": 70.0, "heat": 75.0}
 COST_MULT_BY_WEATHER = {"clear": 1.00, "rain": 1.15, "heat": 1.40}
 # ============================================================
@@ -156,11 +173,14 @@ class FestivalType:
     has_official_resale : bool
         Whether an official face-value resale platform absorbs no-show tickets
     """
-    n_days:              int   = 1
-    is_camping:          bool  = False
-    camping_fraction:    float = 0.0
-    sold_out_fraction:   float = 0.5
-    has_official_resale: bool  = False
+    n_days:                  int   = 1
+    is_camping:              bool  = False
+    camping_fraction:        float = 0.0
+    sold_out_fraction:       float = 0.5
+    has_official_resale:     bool  = False
+    multiday_ticket_fraction: float = 1.0   # fraction of ticket holders with a pass for ALL days
+                                             # 1.0 = everyone has a full-weekend ticket
+                                             # 0.5 = half bought single-day, half bought weekend
 
     def noshow_rates(self) -> Dict[str, float]:
         """
@@ -266,22 +286,49 @@ def step_weather(w: str, rng: np.random.Generator) -> str:
 # ============================================================
 
 def build_bimodal_arrival_fraction(n_steps: int = 64,
-                                   dt_hours: float = 0.25,
-                                   peak1_step: int = 5,    # ~11:15 (gate-open rush)
-                                   peak2_step: int = 36,   # ~19:00 (pre-headliner)
-                                   sigma1: float = 3.0,
-                                   sigma2: float = 4.0,
-                                   weight1: float = 0.60,  # 60% arrive in first wave
-                                   weight2: float = 0.40,  # 40% in pre-headliner wave
+                                   gate_open_hour: int = 10,
+                                   headliner_start_hour: int = 19,
+                                   n_stages: int = 1,
+                                   day: int = 1,
+                                   camping_fraction: float = 0.0,
                                    ) -> np.ndarray:
     """
-    Bimodal arrival profile: gate-open rush + pre-headliner surge.
-    Both components are Gaussian; the result is normalised so sum = 1.
+    Bimodal arrival profile for one day: gate-open rush + pre-headliner surge.
+
+    Parameters derived from research (Ticket Fairy 2025-2026):
+    - Single-stage evening: narrow peaks, strong pre-headliner surge (40/60 split)
+    - Multi-stage all-day: wider softer peaks, gate-open weighted (60/40)
+    - Camping days 2+: campers already inside, single gate-open peak only
     """
     steps = np.arange(n_steps, dtype=float)
+
+    # Peak 1: ~1hr after gate open (gate-open rush)
+    peak1_step = 4  # 1 hour after gate open = 4 steps
+
+    # Peak 2: ~1hr before headliner starts (pre-headliner surge)
+    peak2_step = int((headliner_start_hour - gate_open_hour - 1) * 4)
+    peak2_step = max(peak1_step + 4, min(peak2_step, n_steps - 4))
+
+    # Shape parameters depend on festival type (research table)
+    if n_stages == 1:
+        # Single-stage evening: sharp clustered arrivals, strong pre-headliner
+        sigma1, sigma2 = 2.0, 2.5
+        weight1, weight2 = 0.40, 0.60
+    else:
+        # Multi-stage all-day: staggered arrivals, softer peaks, gate-open weighted
+        sigma1 = 2.5 if camping_fraction < 0.3 else 3.5
+        sigma2 = 5.0
+        weight1, weight2 = 0.60, 0.40  # 60% first wave, 40% pre-headliner
+
     g1 = np.exp(-0.5 * ((steps - peak1_step) / sigma1) ** 2)
-    g2 = np.exp(-0.5 * ((steps - peak2_step) / sigma2) ** 2)
-    raw = weight1 * g1 + weight2 * g2
+
+    if day > 1 and camping_fraction >= 0.5:
+        # Camping days 2+: campers already inside, single gate-open peak only
+        raw = g1
+    else:
+        g2 = np.exp(-0.5 * ((steps - peak2_step) / sigma2) ** 2)
+        raw = weight1 * g1 + weight2 * g2
+
     raw = np.maximum(raw, 0.0)
     return raw / raw.sum()
 
@@ -289,36 +336,66 @@ def build_bimodal_arrival_fraction(n_steps: int = 64,
 def build_departure_fraction(n_steps: int = 64,
                              dt_hours: float = 0.25,
                              day: int = 2,
+                             total_days: int = 3,
+                             camping_fraction: float = 0.95,
+                             n_stages: int = 1,
+                             staggered_end_times: bool = False,
                              headliner_end_step: int = 52,  # ~23:00
-                             sigma_dep: float = 3.5,
                              ) -> np.ndarray:
     """
-    Day-dependent departure profile (Ticket Fairy / industry research):
-      Day 1 (Friday) / Day 2 (Saturday): camping festival — the vast majority
-        stay overnight. Only ~15% leave (mostly day-trippers), spread across
-        the last few hours. No sharp exodus.
-      Day 3 (Sunday, last day): full exodus — all campers AND day-visitors leave.
-        Sharp post-headliner spike (75% of departures in last 3 hours) plus
-        a broader tail as campers pack up. This is the critical egress scenario.
+    Festival-type-aware departure profile (Ticket Fairy / industry research).
+
+    Non-last days:
+      - Camping festival: only ~15% depart (day-trippers). Low camping_fraction
+        means more day-trippers → higher trickle rate (up to ~35%).
+      - Day-tripper festival (camping_fraction~0): 30-40% leave each non-last day.
+
+    Last day (day == total_days):
+      - Single-stage hard end: sharp spike, ~95% leave in a 1hr window. Dangerous.
+      - Multi-stage simultaneous end: broader spike, ~70% in 2hr window.
+      - Multi-stage staggered ends: broadest, safest, ~60% in 2hr window.
+      - Camping last day adds a broad camper tail (packing up tents) on top of spike.
     """
     steps = np.arange(n_steps, dtype=float)
 
-    if day in (1, 2):
-        # Camping night: only ~15% of attendees leave (day-trippers).
-        # Distributed across last 4 hours, no strong spike.
+    if day < total_days:
+        # Non-last day departures:
+        #   - Pure campers (camping_fraction=1): ~15% depart (a few day-trippers/early leavers)
+        #   - Pure day-trippers (camping_fraction=0): ~100% depart — everyone goes home
+        #   - Mixed: interpolate linearly between the two
+        # For day-tripper festivals the shape is still a late-evening concentration
+        # (people don't leave mid-show), but the total fraction is much higher.
+        trickle_rate = 0.15 * camping_fraction + 1.00 * (1.0 - camping_fraction)
         trickle = np.zeros(n_steps)
         trickle[44:] = 1.0   # gradual from ~21:00 onward
         raw = trickle / trickle.sum()
-        # Scale so only 15% of total admitted departs
-        return raw * 0.15
+        return raw * trickle_rate
     else:
-        # Sunday last day: full exodus. Sharp headliner-end spike +
-        # broader camper-departure tail (people leaving staggered as
-        # they pack tents, 22:00-02:00).
-        exodus = np.exp(-0.5 * ((steps - headliner_end_step) / sigma_dep) ** 2)
-        # Camper tail: broader Gaussian centred 1h after headliner end
-        camper_tail = np.exp(-0.5 * ((steps - (headliner_end_step + 4)) / 6.0) ** 2)
-        raw = 0.55 * exodus / exodus.sum() + 0.45 * camper_tail / camper_tail.sum()
+        # Last day: shape depends on stage structure
+        if n_stages == 1:
+            # Single headliner hard end: sharp spike, minimal tail (Ultra Miami scenario)
+            sigma = 2.5
+            spike_w, tail_w = 0.95, 0.05
+        elif staggered_end_times:
+            # Multi-stage staggered: broadest and safest profile
+            sigma = 4.5
+            spike_w, tail_w = 0.60, 0.40
+        else:
+            # Multi-stage simultaneous end: intermediate
+            sigma = 3.5
+            spike_w, tail_w = 0.70, 0.30
+
+        spike = np.exp(-0.5 * ((steps - headliner_end_step) / sigma) ** 2)
+
+        if camping_fraction >= 0.3:
+            # Camping festivals: add a broad tail for tent pack-up (1-4hrs after headliner)
+            tail_centre = headliner_end_step + int(2.0 / dt_hours)   # 2 hours later
+            camper_tail = np.exp(-0.5 * ((steps - tail_centre) / 6.0) ** 2)
+            raw = spike_w * spike / spike.sum() + tail_w * camper_tail / camper_tail.sum()
+        else:
+            # Day-tripper festival: sharp exit, no tent-packing tail
+            raw = spike
+
         raw = np.maximum(raw, 0.0)
         return raw / raw.sum()  # 100% depart on last day
 
@@ -338,6 +415,7 @@ class ZoneSpec:
     arrival_share: float = 0.0             # fraction of festival-wide dispersal
     v_z: int = 1                           # vendor stalls
     adjacent: Tuple[str, ...] = field(default_factory=tuple)
+    is_exogenous: bool = False             # True for zones managed on separate schedule (e.g. camping)
 
 
 # Two entrances — ENTRANCE_SHARE derived from lane ratio (Section 22)
@@ -425,7 +503,8 @@ DEFAULT_ZONES: Dict[str, ZoneSpec] = {
         "camping", area_m2=273000, n_gates=0,
         exit_width_m=120, arrival_share=0.0,  # camping receives NO gate arrivals
         v_z=25,
-        adjacent=("cape_lowlands", "planet_paradise")),
+        adjacent=("cape_lowlands", "planet_paradise"),
+        is_exogenous=True),
 }
 
 # Boundary widths between zones — based on ~600-800m Alpha↔Cape walk (Festileaks)
@@ -514,6 +593,70 @@ class ZoneState:
 
 
 # ============================================================
+# COST MODEL  (Fix 3 — dynamic cost function)
+# ============================================================
+
+@dataclass(frozen=True)
+class CostParams:
+    # Sources: VVNL CAO Veiligheidsdomein 2025-2027 (NL), Aljohani & Kennedy 2016,
+    # Dutch municipal penalty schedule, NL festival operator interviews.
+    omega_s:          float = 400.0    # €/person/day — VVNL CAO 2026 ~€40/hr × 10hr shift
+    omega_surge:      float = 520.0    # €/activation — 2 staff × €42/hr × 6hr + admin
+    omega_v:          float = 350.0    # €/stall/day — organiser infrastructure cost
+    omega_t:          float = 110.0    # €/cubicle/day — NL festival rate incl. mid-day service
+    omega_f:          float = 2000.0   # €/bay/day — Aljohani & Kennedy 2016
+    omega_l:          float = 3100.0   # €/route — 6 stewards × €42/hr × 9hr + equipment
+    omega_viol:       float = 10000.0  # €/violation — Dutch municipal penalty mid-range
+    omega_g:          float = 0.20     # €/scan — RFID equipment amortised (calibrated)
+    omega_z:          float = 8000.0   # €/zone/day — conservative planning estimate
+    # Gate infrastructure
+    omega_lane:       float = 200.0    # €/lane/day — portable RFID scanner rental incl. setup
+    omega_gate_staff: float = 400.0    # €/gate staff/day — VVNL CAO 2026 (1 per lane)
+
+DEFAULT_COST_PARAMS = CostParams()
+
+
+def compute_cost(
+    timeline: "pd.DataFrame",
+    zone_timeline: "pd.DataFrame",
+    scenario: "FestivalScenario",
+    zones: Dict[str, ZoneSpec],
+    cost_params: CostParams = DEFAULT_COST_PARAMS,
+    total_lanes: int = 0,
+) -> float:
+    """Compute total operational cost from actual zone usage and events.
+
+    total_lanes: sum of all turnstile lanes across all entrance gates.
+                 Each lane requires one dedicated gate staff member.
+    """
+    festival_zone_names = [n for n, s in zones.items() if not s.is_exogenous]
+    zone_cost = 0.0
+    for zname in festival_zone_names:
+        ztl_z = zone_timeline[zone_timeline["zone"] == zname]
+        a_z = ztl_z["a_z"].max()
+        v_z = zones[zname].v_z + ztl_z["extra_stalls"].max()
+        s_z = np.ceil(a_z / 100)
+        t_z = np.ceil(a_z / 75)
+        f_z = np.ceil(a_z / 5000)
+        zone_cost += (s_z * cost_params.omega_s
+                    + v_z * cost_params.omega_v
+                    + t_z * cost_params.omega_t
+                    + f_z * cost_params.omega_f
+                    + cost_params.omega_z)
+    surge_activations = timeline["entrance_surge"].sum()
+    total_scans = timeline["total_ever_admitted"].iloc[-1]
+    violations = timeline["V"].iloc[-1]
+    weather_mult = timeline["weather"].map(COST_MULT_BY_WEATHER).mean()
+    # Gate infrastructure: lane hire + one staff member per lane
+    gate_cost = total_lanes * (cost_params.omega_lane + cost_params.omega_gate_staff)
+    return (zone_cost * weather_mult
+            + gate_cost
+            + surge_activations * cost_params.omega_surge
+            + total_scans * cost_params.omega_g
+            + violations * cost_params.omega_viol) / 1000.0
+
+
+# ============================================================
 # FESTIVAL SIMULATION
 # ============================================================
 
@@ -523,31 +666,50 @@ class FestivalScenario:
     a_total: int          # intended total sold attendance
     t_evac_min: int       # T_evac: 8 (strict) or 10 (lenient)
     ticket_price: float = 365.0
-    horizon_steps: int = 64      # 15-min steps over 16 hours
     dt_hours: float = 0.25
     kappa_m: float = 0.05        # inter-zone equilibration rate
     v_max_violation: int = 5
-    day: int = 2   # 1=Friday, 2=Saturday, 3=Sunday (last day). Drives departure curve.
+    # day is no longer a field — it is derived from t // 64 inside run_festival_once
     festival_type: FestivalType = field(
         default_factory=lambda: FESTIVAL_TYPE["camping_sellout"])
     seed: Optional[int] = None
+    # Stage and schedule parameters (drive arrival/departure shapes)
+    n_stages: int = 1                    # 1=single headliner, 2+=multi-stage
+    staggered_end_times: bool = False    # multi-stage: are end times offset?
+    gate_open_hour: int = 10             # wall-clock hour gate opens (10=10:00)
+    headliner_start_hour: int = 19       # wall-clock hour headliner starts (~1hr before end)
+    # Act changeover schedule for schedule-driven inter-zone pulses
+    # List of (step_within_day, from_zone, to_zone) — CHANGEOVER_FRACTION moves at each
+    act_schedule: Tuple[Tuple, ...] = field(default_factory=tuple)
+    # Weather forecast: list of (weather_state, duration_hours) tuples in chronological order.
+    # Duration is converted to steps internally (duration_hours / dt_hours).
+    # e.g. [("rain", 24.0), ("clear", 48.0)] = rain day 1, clear days 2-3.
+    # Steps beyond the forecast revert to pure Markov. Empty = pure Markov throughout.
+    forecast: Tuple[Tuple[str, float], ...] = field(default_factory=tuple)
+    # 0.0 = ignore forecast (pure Markov), 1.0 = treat forecast as certain.
+    # At each forecasted step: use forecast state with p=forecast_confidence,
+    # otherwise draw from Markov chain as normal.
+    forecast_confidence: float = 0.0
+
+    @property
+    def horizon_steps(self) -> int:
+        return 64 * self.festival_type.n_days
 
 @dataclass(frozen=True)
 class AlternativeA(FestivalScenario):
     """Convenience subclass for A1–A4."""
     pass
 
-def make_alternative(label: str, day: int = 2,
-                     festival_type: FestivalType = None) -> FestivalScenario:
+def make_alternative(label: str,
+                     festival_type: FestivalType = None,
+                     n_stages: int = 3,
+                     staggered_end_times: bool = True,
+                     gate_open_hour: int = 10,
+                     headliner_start_hour: int = 23) -> FestivalScenario:
     """
     Build one of the four Lowlands-style alternatives (A1–A4).
-
-    day=1 Friday: most people stay overnight, small day-tripper exodus.
-    day=2 Saturday: same as Friday, minimal overnight departures.
-    day=3 Sunday: full exodus — campers + day visitors all leave.
-
-    festival_type defaults to camping_sellout (Lowlands profile).
-    Pass a different FestivalType to model other festival archetypes.
+    Runs the full multi-day festival as a single continuous simulation.
+    festival_type defaults to camping_sellout (3-day Lowlands profile).
     """
     table = {
         "A1": dict(a_total=45000, t_evac_min=8),
@@ -558,13 +720,21 @@ def make_alternative(label: str, day: int = 2,
     if label not in table:
         raise ValueError(f"Unknown alternative {label!r}")
     ft = festival_type or FESTIVAL_TYPE["camping_sellout"]
-    return FestivalScenario(name=label, day=day, festival_type=ft, **table[label])
+    return FestivalScenario(name=label, festival_type=ft,
+                            n_stages=n_stages, staggered_end_times=staggered_end_times,
+                            gate_open_hour=gate_open_hour,
+                            headliner_start_hour=headliner_start_hour,
+                            **table[label])
 
 
 def make_scenario(name: str, a_total: int, t_evac_min: int,
                   festival_type_key: str = "camping_sellout",
                   festival_type: FestivalType = None,
-                  day: int = 2, **kwargs) -> FestivalScenario:
+                  n_stages: int = 1,
+                  staggered_end_times: bool = False,
+                  gate_open_hour: int = 10,
+                  headliner_start_hour: int = 19,
+                  **kwargs) -> FestivalScenario:
     """
     Generic factory for any festival scenario.
 
@@ -597,7 +767,11 @@ def make_scenario(name: str, a_total: int, t_evac_min: int,
     """
     ft = festival_type or FESTIVAL_TYPE[festival_type_key]
     return FestivalScenario(name=name, a_total=a_total, t_evac_min=t_evac_min,
-                            day=day, festival_type=ft, **kwargs)
+                            festival_type=ft,
+                            n_stages=n_stages, staggered_end_times=staggered_end_times,
+                            gate_open_hour=gate_open_hour,
+                            headliner_start_hour=headliner_start_hour,
+                            **kwargs)
 
 def egress_capacity(zones: Dict[str, ZoneSpec], weather: str, t_evac_min: int) -> float:
     return sum(z.exit_width_m for z in zones.values()) * PHI_BY_WEATHER[weather] * t_evac_min
@@ -609,84 +783,157 @@ def a_max(zones: Dict[str, ZoneSpec], weather: str, t_evac_min: int) -> float:
     return min(holding_capacity(zones), egress_capacity(zones, weather, t_evac_min))
 
 
+def validate_scenario(scenario: FestivalScenario) -> None:
+    assert scenario.a_total > 0, "a_total must be positive"
+    assert scenario.t_evac_min > 0, "t_evac_min must be positive"
+    assert 1 <= scenario.festival_type.n_days <= 8, "n_days must be 1–8"
+
+def validate_festival_type(ft: FestivalType) -> None:
+    assert ft.n_days >= 1, "n_days must be at least 1"
+    assert 0.0 <= ft.camping_fraction <= 1.0, "camping_fraction must be in [0, 1]"
+    assert 0.0 <= ft.sold_out_fraction <= 1.0, "sold_out_fraction must be in [0, 1]"
+
+
 def run_festival_once(
     scenario: FestivalScenario,
     zones: Dict[str, ZoneSpec] = DEFAULT_ZONES,
     seed: Optional[int] = None,
+    entrance_lanes: Optional[Dict[str, int]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Run one stochastic replication.
-    Returns (timeline, zone_timeline).
+    Run one full multi-day replication as a single continuous simulation.
+    horizon_steps = 64 * n_days. Day number and within-day step are derived
+    from t at runtime: day = t // 64 + 1, s = t % 64.
+    Returns (timeline, zone_timeline) with a 'day' column added.
     """
+    validate_scenario(scenario)
+    validate_festival_type(scenario.festival_type)
     rng = np.random.default_rng(seed if seed is not None else scenario.seed)
 
-    states    = {n: ZoneState(s) for n, s in zones.items()}
-    entrances = {n: EntranceState(n) for n in ENTRANCE_LANES}
-    weather   = draw_initial_weather(rng)
-    # No-show rate computed dynamically from festival type attributes
-    noshow_rates = scenario.festival_type.noshow_rates()
-    a_eff_total = scenario.a_total * (1 - noshow_rates[weather])
-
-    V, nu, evacuated = 0, 0, False
-    total_ever_admitted = 0.0  # cumulative admissions (not net of departures)
-    peak_occupancy = 0.0       # max simultaneous occupancy across the day
-    fest_rows, zone_rows = [], []
-
-    # Bimodal arrival profile (gate-open rush + pre-headliner surge)
-    arrival_fraction   = build_bimodal_arrival_fraction(scenario.horizon_steps, scenario.dt_hours)
-    # Day-dependent departure profile
-    departure_fraction = build_departure_fraction(scenario.horizon_steps, scenario.dt_hours,
-                                                  day=scenario.day)
-
-    # ── Camping population model ────────────────────────────────────────────
-    # Camping is physically separated from festival terrain by a wristband
-    # checkpoint. People do NOT receive arrivals into camping through the main
-    # gate, and do NOT flow between camping and festival zones via density
-    # gradient. Instead the camping population follows a daily schedule:
-    #
-    #   Morning (t=0–8, 10:00–12:00): campers wake and walk to festival terrain.
-    #     ~95% of campers cross to festival by midday (sigmoid morning outflow).
-    #   Afternoon/Evening (t=8–48): small residual in camping (resting, etc).
-    #   Night (t=48–64, 22:00–02:00): people trickle back to camping after shows.
-    #     On Sunday (last day): no evening return — full exodus instead.
-    #
-    # camping_fraction from FestivalType: for Lowlands camping_sellout = 0.95
+    n_days       = scenario.festival_type.n_days
+    total_steps  = scenario.horizon_steps   # = 64 * n_days
     camping_fraction = scenario.festival_type.camping_fraction
-    n_campers        = a_eff_total * camping_fraction
-    n_daytrippers    = a_eff_total * (1.0 - camping_fraction)
 
-    _ts = np.arange(scenario.horizon_steps, dtype=float)
-    _morning_out = 1.0 / (1.0 + np.exp(-0.8 * (_ts - 6)))   # sigmoid: half by t=6 (11:30)
-    _evening_in  = 1.0 / (1.0 + np.exp( 0.6 * (_ts - 50)))  # return from t=50 (22:30)
-    camper_on_festival = np.clip(_morning_out - (1.0 - _evening_in) * 0.85, 0.05, 0.95)
-    if scenario.day == 3:  # Sunday: no evening return, full exodus
-        camper_on_festival = np.clip(_morning_out, 0.05, 0.95)
+    _lane_map  = entrance_lanes if entrance_lanes is not None else ENTRANCE_LANES
+    _lane_total = sum(_lane_map.values())
+    _lane_share = {n: v / _lane_total for n, v in _lane_map.items()}
 
-    # Festival terrain zones only (camping excluded from all arrival/flow/departure)
-    festival_zone_names = [n for n in zones if n != "camping"]
+    states    = {n: ZoneState(s) for n, s in zones.items()}
+    entrances = {n: EntranceState(n) for n in _lane_map}
+
+    # Build per-step forecast lookup: forecast_state[t] = weather str or None.
+    # Organizer supplies (state, duration_hours); we convert to steps via dt_hours.
+    forecast_state: List[Optional[str]] = [None] * total_steps
+    if scenario.forecast:
+        cursor = 0
+        for (fcast_w, dur_hours) in scenario.forecast:
+            n_fcast_steps = max(1, round(dur_hours / scenario.dt_hours))
+            for i in range(cursor, min(cursor + n_fcast_steps, total_steps)):
+                forecast_state[i] = fcast_w
+            cursor += n_fcast_steps
+            if cursor >= total_steps:
+                break
+
+    weather   = draw_initial_weather(rng)
+    # Override initial weather if forecast covers step 0
+    if forecast_state[0] is not None and rng.random() < scenario.forecast_confidence:
+        weather = forecast_state[0]
+
+    # No-show rate based on opening-day weather (committed before festival starts)
+    noshow_rates = scenario.festival_type.noshow_rates()
+    a_eff_total  = scenario.a_total * (1 - noshow_rates[weather])
+
+    # Gate arrivals per day:
+    #   Day 1: everyone with a ticket for that day shows up through the gate.
+    #   Day 2+: only people who return through the gate:
+    #     - Campers are already on site — they don't gate-scan again.
+    #     - Single-day ticket holders (1 - multiday_ticket_fraction) don't return.
+    #     - Multi-day non-campers (hotel guests, locals) re-enter through the gate.
+    day_tripper_fraction      = 1.0 - camping_fraction
+    multiday_frac             = scenario.festival_type.multiday_ticket_fraction
+    # returning_day_fraction: of total attendance, who re-enters the gate on days 2+
+    returning_day_fraction    = day_tripper_fraction * multiday_frac
+    gate_arrivals_by_day = {
+        d: (a_eff_total if d == 1 else a_eff_total * returning_day_fraction)
+        for d in range(1, n_days + 1)
+    }
+
+    # Festival terrain zones only (exogenous zones excluded)
+    festival_zone_names = [n for n, s in zones.items() if not s.is_exogenous]
     total_festival_share = sum(zones[n].arrival_share for n in festival_zone_names)
     festival_arrival_share = {
         n: zones[n].arrival_share / total_festival_share
         for n in festival_zone_names
     }
 
-    # Pre-build camping population time series (exogenous, schedule-driven)
-    camping_pop = np.zeros(scenario.horizon_steps)
-    for t in range(scenario.horizon_steps):
-        camping_pop[t] = n_campers * (1.0 - camper_on_festival[t])
+    # Precompute per-day arrival fractions (64 steps each)
+    arrival_frac_by_day = {
+        d: build_bimodal_arrival_fraction(
+            64,
+            gate_open_hour=scenario.gate_open_hour,
+            headliner_start_hour=scenario.headliner_start_hour,
+            n_stages=scenario.n_stages,
+            day=d,
+            camping_fraction=camping_fraction,
+        )
+        for d in range(1, n_days + 1)
+    }
 
-    # Time-varying vendor demand multiplier: meal peaks at lunch (t≈12) and dinner (t≈28)
-    # Base RHO_V is the average; peaks are ~2.5x the off-peak rate.
-    # Steps: t=0 → 10:00, t=8 → 12:00 (lunch), t=28 → 17:00, t=32 → 18:00 (dinner)
-    _steps = np.arange(scenario.horizon_steps, dtype=float)
-    _lunch  = np.exp(-0.5 * ((_steps - 8)  / 2.5) ** 2)   # peak 12:00
-    _dinner = np.exp(-0.5 * ((_steps - 32) / 3.0) ** 2)   # peak 18:00
-    _snack  = np.exp(-0.5 * ((_steps - 48) / 4.0) ** 2)   # late snack ~22:00
-    _meal_mult_raw = 0.3 + 1.0 * _lunch + 1.5 * _dinner + 0.8 * _snack
-    # Normalise so mean = 1.0 (RHO_V stays calibrated on average)
-    vendor_mult = _meal_mult_raw / _meal_mult_raw.mean()
+    # Precompute per-day departure fractions (64 steps each)
+    headliner_end_step = int((scenario.headliner_start_hour - scenario.gate_open_hour + 1) * 4)
+    departure_frac_by_day = {
+        d: build_departure_fraction(
+            64,
+            day=d,
+            total_days=n_days,
+            camping_fraction=camping_fraction,
+            n_stages=scenario.n_stages,
+            staggered_end_times=scenario.staggered_end_times,
+            headliner_end_step=headliner_end_step,
+        )
+        for d in range(1, n_days + 1)
+    }
 
-    for t in range(scenario.horizon_steps):
+    # Precompute camping population per day per within-day step.
+    # Same sigmoid shape each morning — campers leave camping for festival terrain,
+    # return at night (except last day: full exodus).
+    n_campers = a_eff_total * camping_fraction
+    _s64 = np.arange(64, dtype=float)
+    _morning_out = 1.0 / (1.0 + np.exp(-0.8 * (_s64 - 6)))
+    _evening_in  = 1.0 / (1.0 + np.exp( 0.6 * (_s64 - 50)))
+    _camper_on_festival_normal   = np.clip(_morning_out - (1.0 - _evening_in) * 0.85, 0.05, 0.95)
+    _camper_on_festival_last_day = np.clip(_morning_out, 0.05, 0.95)
+    camping_pop_by_day = {}
+    for d in range(1, n_days + 1):
+        cof = _camper_on_festival_last_day if d == n_days else _camper_on_festival_normal
+        camping_pop_by_day[d] = n_campers * (1.0 - cof)
+
+    # Vendor meal multiplier — same pattern each day (anchored to within-day step)
+    _lunch  = np.exp(-0.5 * ((_s64 - 8)  / 2.5) ** 2)
+    _dinner = np.exp(-0.5 * ((_s64 - 32) / 3.0) ** 2)
+    _snack  = np.exp(-0.5 * ((_s64 - 48) / 4.0) ** 2)
+    _meal_raw = 0.3 + 1.0 * _lunch + 1.5 * _dinner + 0.8 * _snack
+    vendor_mult_day = _meal_raw / _meal_raw.mean()
+
+    V, nu, evacuated = 0, 0, False
+    W_density = 0          # cumulative density warnings (soft tier, does not drive evacuation)
+    total_ever_admitted = 0.0
+    peak_occupancy      = 0.0
+    fest_rows, zone_rows = [], []
+
+    # Precompute the set of within-day steps that fall inside a performance window.
+    # act_schedule entries are (step_within_day, from_zone, to_zone) — the step is
+    # treated as the act changeover moment; the window covers ±PERFORMANCE_WINDOW_STEPS.
+    performance_steps: set = set()
+    if scenario.act_schedule:
+        for (pulse_step, _fz, _tz) in scenario.act_schedule:
+            for offset in range(-PERFORMANCE_WINDOW_STEPS, PERFORMANCE_WINDOW_STEPS + 1):
+                performance_steps.add(pulse_step + offset)
+
+    for t in range(total_steps):
+        day = t // 64 + 1          # 1-indexed festival day
+        s   = t % 64               # within-day step (0-63)
+
         d_max_w  = D_MAX_BY_WEATHER[weather]
         amax_now = a_max(zones, weather, scenario.t_evac_min)
         entrance_surge = False
@@ -695,17 +942,18 @@ def run_festival_once(
             for st in states.values():
                 st.a = 0.0
         else:
-            # ── camping: set exogenously from schedule ──────────────
-            # Wristband checkpoint — not connected to gate arrivals or gradient flow
-            states["camping"].a = camping_pop[t]
+            # ── exogenous zones: set from daily schedule ───────────
+            for n, spec in zones.items():
+                if spec.is_exogenous:
+                    states[n].a = camping_pop_by_day[day][s]
 
-            # ── shared entrance queue (main + secondary) ───────────
-            step_in = a_eff_total * arrival_fraction[t]
+            # ── shared entrance queue ──────────────────────────────
+            step_in = gate_arrivals_by_day[day] * arrival_frac_by_day[day][s]
             total_admitted = 0.0
             surge_map = {}
             for en, ent in entrances.items():
-                ent.q += step_in * ENTRANCE_SHARE[en]
-                nl    = ENTRANCE_LANES[en]
+                ent.q += step_in * _lane_share[en]
+                nl    = _lane_map[en]
                 surge = ent.q > Q_MAX_GATE
                 surge_map[en] = surge
                 g_eff    = G_BASE_PER_MIN * nl * (1.6 if surge else 1.0)
@@ -715,30 +963,27 @@ def run_festival_once(
             entrance_surge = any(surge_map.values())
             total_ever_admitted += total_admitted
 
-            # Dispersal to FESTIVAL TERRAIN ZONES ONLY (not camping)
+            # Disperse gate admissions to festival terrain zones
             for n in festival_zone_names:
                 states[n].a += total_admitted * festival_arrival_share[n]
 
-            # ── departures from festival terrain only ───────────────
+            # ── departures from festival terrain ───────────────────
             festival_a_now = sum(states[n].a for n in festival_zone_names)
-            departures_this_step = festival_a_now * departure_fraction[t]
+            departures_this_step = festival_a_now * departure_frac_by_day[day][s]
             if festival_a_now > 0:
                 for n in festival_zone_names:
                     zone_share = states[n].a / festival_a_now
                     states[n].a = max(0.0, states[n].a - departures_this_step * zone_share)
 
-            # ── vendor queues (Section 21) ─────────────────────────
-            # RHO_V * vendor_mult[t] gives time-varying demand:
-            # peaks at lunch (~12:00), dinner (~18:00), late snack (~22:00)
+            # ── vendor queues ──────────────────────────────────────
             for st in states.values():
-                demand = rng.poisson(RHO_V * vendor_mult[t] * st.a)
+                demand = rng.poisson(RHO_V * vendor_mult_day[s] * st.a)
                 served = st.v_z_effective * SIGMA_V * scenario.dt_hours * 60
                 st.q_vendor = max(0.0, st.q_vendor + demand - served)
                 if st.q_vendor > Q_MAX_VENDOR * st.v_z_effective:
                     st.extra_stalls += 1
 
-            # ── inter-zone movement: festival terrain only ──────────
-            # Camping excluded — wristband checkpoint prevents gradient flow
+            # ── inter-zone movement ────────────────────────────────
             moves = {n: 0.0 for n in festival_zone_names}
             for n in festival_zone_names:
                 st = states[n]
@@ -751,42 +996,62 @@ def run_festival_once(
                         flow  = scenario.kappa_m * grad * width * 50.0
                         moves[n]   -= flow
                         moves[nbr] += flow
+
+            # Schedule-driven act-changeover pulses (step_within_day matches)
+            CHANGEOVER_FRACTION = 0.25
+            for (pulse_step, from_zone, to_zone) in scenario.act_schedule:
+                if s == pulse_step and from_zone in festival_zone_names \
+                        and to_zone in festival_zone_names:
+                    pulse = states[from_zone].a * CHANGEOVER_FRACTION
+                    moves[from_zone] -= pulse
+                    moves[to_zone]   += pulse
+
             for n in festival_zone_names:
                 states[n].a = max(0.0, states[n].a + moves[n])
 
-            # ── incidents (Section 17 / 22.9) ──────────────────────
+            # ── incidents ─────────────────────────────────────────
             for st in states.values():
                 inc = sample_incidents(st.a, weather, scenario.dt_hours, rng)
                 for k, v in inc.items():
                     st.incidents_cum[k] += v
 
-            # ── violations: festival terrain only ───────────────────
-            # Camping excluded — separately managed, low density by design
+            # ── density tiers + violations: festival terrain only ──
             fest_a_tot = sum(states[n].a for n in festival_zone_names)
             total_a    = sum(st.a for st in states.values())
-            density_ok = all(states[n].density <= d_max_w for n in festival_zone_names)
+
+            # Violation check uses THETA_WARN / THETA_VIOLATION (zone-average thresholds),
+            # not D_MAX_BY_WEATHER — D_max is only for permit capacity, not operations.
+            # During a scheduled performance window the hard limit relaxes to D_MAX_PERFORMANCE.
+            in_performance = bool(performance_steps) and (s in performance_steps)
+            d_hard = (D_MAX_PERFORMANCE[weather] if in_performance else THETA_VIOLATION[weather])
+
+            for n in festival_zone_names:
+                dens = states[n].density
+                if dens > d_hard:
+                    V += 1          # hard violation — drives evacuation
+                    break           # one V per step regardless of how many zones breach
+                elif dens > THETA_WARN[weather]:
+                    W_density += 1  # soft warning — logged only
+
             capacity_ok = fest_a_tot <= amax_now
-            if not density_ok or not capacity_ok:
+            if not capacity_ok:
                 V += 1
 
-            # noise complaints — sampled hourly (every 4 steps)
-            if t % 4 == 0:
+            # Noise complaints — sampled hourly (every 4 within-day steps)
+            if s % 4 == 0:
                 chi_nu = 0.8 if weather == "rain" else 1.0
-                nu += rng.poisson(0.3 * (total_a / 65000.0) * chi_nu)
+                nu += rng.poisson(0.3 * (total_a / max(1, scenario.a_total)) * chi_nu)
 
             if V > scenario.v_max_violation:
                 evacuated = True
 
-        # ── log ────────────────────────────────────────────────────
-        # total_a_now  = everyone on site (festival + camping)
-        # festival_a   = festival terrain only (safety-relevant for density/capacity)
-        # peak_occupancy tracks festival terrain peak only
+        # ── log ───────────────────────────────────────────────────
         total_a_now  = sum(st.a for st in states.values())
         festival_a   = sum(states[n].a for n in festival_zone_names)
         peak_occupancy = max(peak_occupancy, festival_a)
         for n, st in states.items():
             zone_rows.append({
-                "t": t, "zone": n,
+                "t": t, "day": day, "zone": n,
                 "a_z": st.a, "density": st.density,
                 "q_vendor": st.q_vendor, "extra_stalls": st.extra_stalls,
                 "minor":    st.incidents_cum["minor"],
@@ -794,17 +1059,25 @@ def run_festival_once(
                 "critical": st.incidents_cum["critical"],
             })
         fest_rows.append({
-            "t": t, "weather": weather, "V": V, "nu": nu,
+            "t": t, "day": day, "weather": weather, "V": V, "nu": nu,
+            "W_density": W_density,
             "A_max": amax_now,
-            "total_a":      total_a_now,    # everyone on site incl. camping
-            "festival_a":   festival_a,     # festival terrain only (safety-relevant)
+            "total_a":             total_a_now,
+            "festival_a":          festival_a,
             "entrance_q":          sum(e.q for e in entrances.values()),
             "entrance_surge":      entrance_surge,
             "evacuated":           evacuated,
             "total_ever_admitted": total_ever_admitted,
             "peak_occupancy":      peak_occupancy,
         })
-        weather = step_weather(weather, rng)
+        next_t = t + 1
+        markov_next = step_weather(weather, rng)
+        if (next_t < total_steps
+                and forecast_state[next_t] is not None
+                and rng.random() < scenario.forecast_confidence):
+            weather = forecast_state[next_t]
+        else:
+            weather = markov_next
 
     return pd.DataFrame(fest_rows), pd.DataFrame(zone_rows)
 
@@ -817,7 +1090,9 @@ def aggregate_run(
     timeline: pd.DataFrame,
     zone_timeline: pd.DataFrame,
     scenario: FestivalScenario,
-    omega_z_total: float = 391090.0,   # sum_z b_z baseline (Section 25, A4)
+    zones: Dict[str, ZoneSpec] = DEFAULT_ZONES,
+    cost_params: CostParams = DEFAULT_COST_PARAMS,
+    total_lanes: int = 0,
 ) -> Dict:
     p  = scenario.ticket_price
     T_evac = scenario.t_evac_min
@@ -825,19 +1100,19 @@ def aggregate_run(
     # ── Revenue R: based on total people who attended (not end-of-night occupancy) ──
     R = p * timeline["total_ever_admitted"].iloc[-1] / 1000.0
 
-    # ── Cost C  (time-averaged, weather-multiplied) ─────────────
-    C = (timeline["weather"].map(COST_MULT_BY_WEATHER) * (omega_z_total / 1000.0)).mean()
+    # ── Cost C: dynamic from actual zone usage, events, and weather ─────────────
+    C = compute_cost(timeline, zone_timeline, scenario, zones, cost_params, total_lanes)
 
     # ── Peak density D ──────────────────────────────────────────
     D = zone_timeline["density"].max()
 
     # ── Queue pressure Q: peak vendor queue per stall (festival zones only) ─
-    # Camping excluded: campers self-cater, camping stalls serve snacks only
-    festival_zones = [z for z in DEFAULT_ZONES if z != "camping"]
+    # Exogenous zones (camping) excluded: campers self-cater
+    festival_zones = [n for n, s in zones.items() if not s.is_exogenous]
     zone_tl_festival = zone_timeline[zone_timeline["zone"].isin(festival_zones)]
     Q = (zone_tl_festival["q_vendor"] /
          zone_tl_festival.apply(
-             lambda r: DEFAULT_ZONES[r["zone"]].v_z + r["extra_stalls"], axis=1)
+             lambda r: zones[r["zone"]].v_z + r["extra_stalls"], axis=1)
          ).max()
 
     # ── Severity penalty Phi  (FIX 5: per-zone squaring) ────────
@@ -849,13 +1124,14 @@ def aggregate_run(
          + OMEGA["moderate"] * moderate_z.sum()
          + OMEGA["critical"] * (critical_z ** 2).sum())  # per-zone squaring
 
-    V_f  = timeline["V"].iloc[-1]
-    nu_f = timeline["nu"].iloc[-1]
+    V_f       = timeline["V"].iloc[-1]
+    nu_f      = timeline["nu"].iloc[-1]
+    W_dens_f  = timeline["W_density"].iloc[-1]
     total_ever   = timeline["total_ever_admitted"].iloc[-1]
     peak_occ     = timeline["peak_occupancy"].iloc[-1]
 
     # ── Infrastructure strain I (proxy: peak occupancy / max capacity) ─
-    I = peak_occ / 65000.0
+    I = peak_occ / max(1, scenario.a_total)
 
     # ── u_O  (Section 13.4 / 6.1) ──────────────────────────────
     # u_O = 3R - 2C - gamma_O*D - delta_O*Q - Phi
@@ -886,6 +1162,7 @@ def aggregate_run(
     attends = u_A >= U_A_MIN
 
     feasible = V_f == 0 and not timeline["evacuated"].any()
+    surge_activations = int(timeline["entrance_surge"].sum())
 
     return {
         "scenario":           scenario.name,
@@ -896,6 +1173,7 @@ def aggregate_run(
         "D":                  D,
         "Q":                  Q,
         "V":                  V_f,
+        "W_density":          W_dens_f,
         "nu":                 nu_f,
         "Phi":                phi,
         "I":                  I,
@@ -905,16 +1183,23 @@ def aggregate_run(
         "peak_occupancy":     peak_occ,
         "total_ever_admitted":total_ever,
         "feasible":           feasible,
+        "surge_activations":  surge_activations,
     }
 
 
 def monte_carlo(scenario: FestivalScenario, n_runs: int = 100,
-                seed: int = 2026,
-                zones: Dict[str, ZoneSpec] = DEFAULT_ZONES) -> pd.DataFrame:
+                seed: int = None,
+                zones: Dict[str, ZoneSpec] = DEFAULT_ZONES,
+                cost_params: CostParams = DEFAULT_COST_PARAMS,
+                total_lanes: int = 0,
+                entrance_lanes: Optional[Dict[str, int]] = None) -> pd.DataFrame:
+    base_seed = seed if seed is not None else (scenario.seed if scenario.seed is not None else 2026)
     rows = []
     for run in range(n_runs):
-        tl, ztl = run_festival_once(scenario, zones=zones, seed=seed + 17*run)
-        rows.append(aggregate_run(tl, ztl, scenario))
+        tl, ztl = run_festival_once(scenario, zones=zones, seed=base_seed + 17*run,
+                                    entrance_lanes=entrance_lanes)
+        rows.append(aggregate_run(tl, ztl, scenario, zones=zones,
+                                  cost_params=cost_params, total_lanes=total_lanes))
     return pd.DataFrame(rows)
 
 
@@ -931,6 +1216,7 @@ def summarize_alternative(df: pd.DataFrame) -> Dict:
         "mean_critical":     df["critical"].mean(),
         "mean_peak_occ":     df["peak_occupancy"].mean(),
         "mean_ever_admitted":df["total_ever_admitted"].mean(),
+        "mean_W_density":    df["W_density"].mean(),
     }
 
 
@@ -938,7 +1224,7 @@ def summarize_alternative(df: pd.DataFrame) -> Dict:
 # VISUALISATION
 # ============================================================
 
-_HOURS = np.arange(64) * 0.25
+_HOURS = np.arange(512) * 0.25  # supports up to 8-day festivals (8 × 64 steps)
 
 def _time_label(h: float) -> str:
     total_min = int(h * 60)
@@ -1025,11 +1311,17 @@ def plot_day_overview(timeline: pd.DataFrame, zone_tl: pd.DataFrame,
 
 
 def plot_zone_density(zone_tl: pd.DataFrame, timeline: pd.DataFrame = None) -> plt.Figure:
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True, sharey=True)
+    zone_names = sorted(zone_tl["zone"].unique())
+    n = len(zone_names)
+    ncols = min(n, 2)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(13, 4 * nrows), sharex=True, sharey=True)
+    axes_flat = np.array(axes).flat if n > 1 else [axes]
     fig.suptitle("Zone Crowd Density over Festival Day", y=0.98)
     hours = _HOURS[:zone_tl["t"].max() + 1]
 
-    for ax, (zname, colour) in zip(axes.flat, ZONE_COLOURS.items()):
+    for idx, (ax, zname) in enumerate(zip(axes_flat, zone_names)):
+        colour = _zone_colour(zname, idx)
         zdata   = zone_tl[zone_tl["zone"] == zname]
         density = zdata["density"].values
         ax.fill_between(hours, density, alpha=0.2, color=colour)
@@ -1051,18 +1343,25 @@ def plot_zone_density(zone_tl: pd.DataFrame, timeline: pd.DataFrame = None) -> p
     return fig
 
 
-def plot_vendor_queues(zone_tl: pd.DataFrame) -> plt.Figure:
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
+def plot_vendor_queues(zone_tl: pd.DataFrame,
+                       zones: Dict[str, ZoneSpec] = DEFAULT_ZONES) -> plt.Figure:
+    zone_names = sorted(zone_tl["zone"].unique())
+    n = len(zone_names)
+    ncols = min(n, 2)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(13, 4 * nrows), sharex=True)
+    axes_flat = np.array(axes).flat if n > 1 else [axes]
     fig.suptitle("Vendor Queue per Stall by Zone", y=0.98)
     hours = _HOURS[:zone_tl["t"].max() + 1]
 
-    for ax, (zname, colour) in zip(axes.flat, ZONE_COLOURS.items()):
+    for idx, (ax, zname) in enumerate(zip(axes_flat, zone_names)):
+        colour = _zone_colour(zname, idx)
         zdata = zone_tl[zone_tl["zone"] == zname]
-        v_z   = DEFAULT_ZONES[zname].v_z
+        v_z   = zones[zname].v_z if zname in zones else 1
         q_per_stall = zdata["q_vendor"].values / (
             (v_z + zdata["extra_stalls"].values).clip(min=1))
         ax.fill_between(hours, q_per_stall, alpha=0.18, color=colour)
-        ax.plot(hours, q_per_stall, color=colour, lw=2.2)
+        ax.plot(hours, q_per_stall, colour, lw=2.2)
         deployed = zdata["extra_stalls"].values > 0
         ax.fill_between(hours, 0, q_per_stall, where=deployed,
                         color=SUCCESS, alpha=0.15, label="Extra stalls deployed")
@@ -1099,18 +1398,18 @@ def plot_incidents(zone_tl: pd.DataFrame) -> plt.Figure:
     ax.legend(loc="upper left")
     _hours_ticks(ax)
 
-    zones      = list(ZONE_COLOURS.keys())
+    zone_names_inc = sorted(zone_tl["zone"].unique())
     final      = zone_tl[zone_tl["t"] == zone_tl["t"].max()]
-    x          = np.arange(len(zones))
+    x          = np.arange(len(zone_names_inc))
     w          = 0.25
-    bars_minor = [final[final["zone"] == z]["minor"].values[0]    for z in zones]
-    bars_mod   = [final[final["zone"] == z]["moderate"].values[0] for z in zones]
-    bars_crit  = [final[final["zone"] == z]["critical"].values[0] for z in zones]
+    bars_minor = [final[final["zone"] == z]["minor"].values[0]    for z in zone_names_inc]
+    bars_mod   = [final[final["zone"] == z]["moderate"].values[0] for z in zone_names_inc]
+    bars_crit  = [final[final["zone"] == z]["critical"].values[0] for z in zone_names_inc]
     ax2.bar(x - w, bars_minor, w, label="Minor",    color="#66BB6A", alpha=0.85)
     ax2.bar(x,     bars_mod,   w, label="Moderate", color="#FFA726", alpha=0.85)
     ax2.bar(x + w, bars_crit,  w, label="Critical", color="#EF5350", alpha=0.85)
     ax2.set_xticks(x)
-    ax2.set_xticklabels([z.replace("_", " ").title() for z in zones], fontsize=8)
+    ax2.set_xticklabels([z.replace("_", " ").title() for z in zone_names_inc], fontsize=8)
     ax2.set_title("End-of-Day Incidents by Zone")
     ax2.set_ylabel("Count")
     ax2.legend()
@@ -1216,6 +1515,7 @@ def print_summary_table(summaries: Dict, results: Dict) -> None:
             "Attends (%)":     f"{s['frac_attends']*100:.0f}%",
             "Feasible (%)":    f"{s['frac_feasible']*100:.0f}%",
             "Mean D (p/m²)":   f"{s['mean_D']:.3f}",
+            "Density warns":   f"{s['mean_W_density']:.0f}",
             "Mean Q (q/stall)":f"{s['mean_Q']:.2f}",
             "Mean critical":   f"{s['mean_critical']:.2f}",
             "Peak occ.":       f"{s['mean_peak_occ']:,.0f}",
@@ -1230,6 +1530,210 @@ def print_summary_table(summaries: Dict, results: Dict) -> None:
 
 
 # ============================================================
+# PLANNING LAYER
+# ============================================================
+
+@dataclass
+class FestivalPlan:
+    name: str
+    zone_areas: Dict[str, float]       # {zone_name: usable_area_m2}
+    entrance_lanes: Dict[str, int]     # {"main": 20, "secondary": 10}
+    ticket_sales: int
+    ticket_price: float
+    n_days: int
+    t_evac_min: int
+    exit_widths: Dict[str, float] = field(default_factory=dict)   # auto-estimated if empty
+    is_camping: bool = False
+    camping_fraction: float = 0.0
+    sold_out_fraction: float = 1.0
+    has_official_resale: bool = False
+    multiday_ticket_fraction: float = 1.0
+    total_budget: Optional[float] = None
+    n_stages: int = 1
+    staggered_end_times: bool = False
+    gate_open_hour: int = 10
+    headliner_start_hour: int = 19
+    n_runs: int = 100
+    seed: int = 2026
+
+
+def _estimate_exit_widths(
+    zone_areas: Dict[str, float],
+    ticket_sales: int,
+    t_evac_min: int,
+) -> Dict[str, float]:
+    """SGSA standard: total width = ticket_sales / (70 p/m × T_evac), split by zone area."""
+    total_width = ticket_sales / (70 * t_evac_min)
+    total_area  = sum(zone_areas.values())
+    return {name: round(total_width * area / total_area, 1) for name, area in zone_areas.items()}
+
+
+@dataclass
+class PlanReport:
+    plan: FestivalPlan
+    resources: Dict[str, Dict]
+    baseline_cost: float
+    a_max_by_weather: Dict[str, float]
+    mc_results: pd.DataFrame
+    summary: Dict
+    noshow_rates: Dict[str, float]
+    total_lanes: int = 0
+    gate_cost: float = 0.0
+    cost_params: CostParams = None
+
+    def print_summary(self) -> None:
+        p, s = self.plan, self.summary
+        print(f"\n{'='*60}")
+        print(f"  FESTIVAL PLANNING REPORT: {p.name}")
+        print(f"{'='*60}")
+        print(f"  Tickets sold:  {p.ticket_sales:,}")
+        print(f"  Ticket price:  €{p.ticket_price:.2f}")
+        print(f"  Days:          {p.n_days}    T_evac: {p.t_evac_min} min")
+        print(f"  Camping:       {'Yes' if p.is_camping else 'No'} ({p.camping_fraction:.0%} fraction)")
+        print(f"  Stages:        {p.n_stages}  Staggered ends: {p.staggered_end_times}")
+
+        print(f"\n--- FEASIBILITY BY WEATHER ---")
+        for w, amax in self.a_max_by_weather.items():
+            noshow  = self.noshow_rates[w]
+            eff     = int(p.ticket_sales * (1 - noshow))
+            status  = "✓ FEASIBLE" if eff <= amax else "✗ INFEASIBLE"
+            print(f"  {w:<8}  A_max={amax:,.0f}  effective={eff:,}  {status}")
+
+        print(f"\n--- MINIMUM RESOURCE REQUIREMENTS ---")
+        print(f"  {'Zone':<20} {'Attend':>8} {'Staff':>6} {'Stalls':>7} {'Toilets':>8} {'First Aid':>10}")
+        print(f"  {'-'*60}")
+        totals: Dict[str, int] = {k: 0 for k in ("attendance","staff","vendor_stalls","toilets","first_aid")}
+        for zname, r in self.resources.items():
+            print(f"  {zname:<20} {r['attendance']:>8,} {r['staff']:>6} "
+                  f"{r['vendor_stalls']:>7} {r['toilets']:>8} {r['first_aid']:>10}")
+            for k in totals:
+                totals[k] += r[k]
+        print(f"  {'TOTAL':<20} {totals['attendance']:>8,} {totals['staff']:>6} "
+              f"{totals['vendor_stalls']:>7} {totals['toilets']:>8} {totals['first_aid']:>10}")
+
+        print(f"\n--- COST ESTIMATE ---")
+        print(f"  Baseline (min resources, clear weather):  €{self.baseline_cost:,.0f}/day")
+        print(f"  Rain scenario  (+15%):                    €{self.baseline_cost * 1.15:,.0f}/day")
+        print(f"  Heat scenario  (+40%):                    €{self.baseline_cost * 1.40:,.0f}/day")
+        if p.total_budget is not None:
+            status = "✓ within budget" if self.baseline_cost <= p.total_budget else "✗ EXCEEDS BUDGET"
+            print(f"  Budget provided:                          €{p.total_budget:,.0f}/day  →  {status}")
+
+        print(f"\n--- MONTE CARLO RESULTS ({p.n_runs} runs) ---")
+        print(f"  E[u_O]:         {s['E_uO']:,.0f}")
+        print(f"  E[u_A]:         {s['E_uA']:.2f}")
+        print(f"  Feasibility:    {s['frac_feasible']:.0%} of runs (V=0, no evacuation)")
+        print(f"  Mean peak occ.: {s['mean_peak_occ']:,.0f}")
+        print(f"  Mean density:   {s['mean_D']:.3f} p/m²")
+        print(f"  Density warns:  {s['mean_W_density']:.0f} avg per run")
+
+        print(f"\n--- BAYESIAN CAPACITY RULES ---")
+        rain_cap = int(min(self.a_max_by_weather["rain"], p.ticket_sales))
+        print(f"  Clear forecast (P(rain) < 0.20):  operate at full {p.ticket_sales:,}")
+        print(f"  Rain forecast  (P(rain) > 0.85):  reduce to {rain_cap:,} (rain egress cap)")
+        print(f"  Double rain signal (P > 0.95):    mandatory reduction or extend T_evac")
+        print(f"{'='*60}\n")
+
+
+def generate_plan(
+    plan: FestivalPlan,
+    cost_params: CostParams = None,
+) -> PlanReport:
+    if cost_params is None:
+        cost_params = CostParams()
+
+    # ── 1. Allocate attendance and compute minimum resources per zone ──
+    S_MAX, V_MAX, R_MAX, F_MAX = 100, 250, 75, 5000
+    total_area = sum(plan.zone_areas.values())
+    resources: Dict[str, Dict] = {}
+    for zname, area in plan.zone_areas.items():
+        a_z = int(plan.ticket_sales * area / total_area)
+        resources[zname] = {
+            "attendance":    a_z,
+            "staff":         math.ceil(a_z / S_MAX),
+            "vendor_stalls": math.ceil(a_z / V_MAX),
+            "toilets":       math.ceil(a_z / R_MAX),
+            "first_aid":     math.ceil(a_z / F_MAX),
+        }
+
+    # ── 2. Estimate exit widths if not provided ────────────────────────
+    exit_widths = plan.exit_widths if plan.exit_widths else _estimate_exit_widths(
+        plan.zone_areas, plan.ticket_sales, plan.t_evac_min
+    )
+
+    # ── 3. Build ZoneSpec objects ──────────────────────────────────────
+    zones: Dict[str, ZoneSpec] = {
+        zname: ZoneSpec(
+            name=zname,
+            area_m2=area,
+            n_gates=0,
+            exit_width_m=exit_widths.get(zname, 0.0),
+            arrival_share=area / total_area,
+            v_z=resources[zname]["vendor_stalls"],
+            is_exogenous=(zname == "camping" or resources[zname]["attendance"] == 0),
+        )
+        for zname, area in plan.zone_areas.items()
+    }
+
+    # ── 4. Build FestivalType and FestivalScenario ─────────────────────
+    ft = FestivalType(
+        n_days=plan.n_days,
+        is_camping=plan.is_camping,
+        camping_fraction=plan.camping_fraction,
+        sold_out_fraction=plan.sold_out_fraction,
+        has_official_resale=plan.has_official_resale,
+        multiday_ticket_fraction=plan.multiday_ticket_fraction,
+    )
+    scenario = make_scenario(
+        name=plan.name,
+        a_total=plan.ticket_sales,
+        t_evac_min=plan.t_evac_min,
+        ticket_price=plan.ticket_price,
+        festival_type=ft,
+        n_stages=plan.n_stages,
+        staggered_end_times=plan.staggered_end_times,
+        gate_open_hour=plan.gate_open_hour,
+        headliner_start_hour=plan.headliner_start_hour,
+        seed=plan.seed,
+    )
+
+    # ── 5. Run Monte Carlo ─────────────────────────────────────────────
+    total_lanes = sum(plan.entrance_lanes.values())
+    mc_results = monte_carlo(scenario, n_runs=plan.n_runs, seed=plan.seed, zones=zones,
+                             cost_params=cost_params, total_lanes=total_lanes)
+
+    # ── 6. Baseline cost from minimum resources ────────────────────────
+    gate_cost = total_lanes * (cost_params.omega_lane + cost_params.omega_gate_staff)
+    baseline_cost = (
+        sum(
+            r["staff"]         * cost_params.omega_s
+            + r["vendor_stalls"] * cost_params.omega_v
+            + r["toilets"]       * cost_params.omega_t
+            + r["first_aid"]     * cost_params.omega_f
+            + cost_params.omega_z
+            for r in resources.values()
+        )
+        + gate_cost
+    )
+
+    # ── 7. A_max per weather state ─────────────────────────────────────
+    a_max_by_weather = {w: a_max(zones, w, plan.t_evac_min) for w in WEATHER_STATES}
+
+    return PlanReport(
+        plan=plan,
+        resources=resources,
+        baseline_cost=baseline_cost,
+        a_max_by_weather=a_max_by_weather,
+        mc_results=mc_results,
+        summary=summarize_alternative(mc_results),
+        noshow_rates=ft.noshow_rates(),
+        total_lanes=total_lanes,
+        gate_cost=gate_cost / 1000.0,
+        cost_params=cost_params,
+    )
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -1237,21 +1741,38 @@ if __name__ == "__main__":
     # ── Dynamic no-show rates across festival types ───────────
     print_noshow_table()
 
-    # ── Validate profiles ─────────────────────────────────────
-    af = build_bimodal_arrival_fraction()
-    print(f"Arrival profile: peak1 at t=5 (11.2h), peak2 at t=36 (19.0h)")
-    print(f"  First wave (t<20, first 5hrs): {af[:20].sum()*100:.1f}% of arrivals")
-    for d, label in [(1,"Fri"),(2,"Sat"),(3,"Sun")]:
-        df_dep = build_departure_fraction(day=d)
-        print(f"Departure [{label}]: departs {df_dep.sum()*100:.0f}% of admitted, "
-              f"last-3hrs share={df_dep[48:].sum()/max(df_dep.sum(),1e-9)*100:.0f}%")
+    # ── Validate profiles across festival types ───────────────
+    print("Arrival profiles by festival type:")
+    for label, n_st, cf in [("Multi-stage camping (Lowlands)", 3, 0.95),
+                              ("Single-stage evening concert",  1, 0.0),
+                              ("Multi-stage day-tripper",       3, 0.0)]:
+        af = build_bimodal_arrival_fraction(n_stages=n_st, camping_fraction=cf,
+                                            gate_open_hour=10, headliner_start_hour=23
+                                            if n_st > 1 else 19)
+        print(f"  {label}: first-wave {af[:20].sum()*100:.0f}%  "
+              f"second-wave {af[20:].sum()*100:.0f}%")
 
-    # ── Single A4 Sunday run (worst-case day) ─────────────────
-    print("\nRunning single A4 Sunday simulation (worst-case egress)...")
-    scn_a4 = make_alternative("A4", day=3)
+    print("Departure profiles by festival type (last day):")
+    for label, n_st, stag, cf in [
+            ("Single headliner",          1, False, 0.0),
+            ("Multi-stage simultaneous",  3, False, 0.0),
+            ("Multi-stage staggered",     3, True,  0.0),
+            ("Camping multi-day last day",3, True,  0.95)]:
+        dep = build_departure_fraction(day=3, total_days=3, n_stages=n_st,
+                                       staggered_end_times=stag, camping_fraction=cf)
+        print(f"  {label}: last-3hrs {dep[48:].sum()*100:.0f}% of total")
+    for d, lbl in [(1,"Fri"),(2,"Sat")]:
+        dep = build_departure_fraction(day=d, total_days=3, camping_fraction=0.95)
+        print(f"  Camping non-last [{lbl}]: {dep.sum()*100:.0f}% depart")
+
+    # ── Single A4 full 3-day run ───────────────────────────────
+    print("\nRunning single A4 full 3-day simulation...")
+    scn_a4 = make_alternative("A4")
     timeline, zone_tl = run_festival_once(scn_a4, seed=2026)
-    print(f"  Peak occupancy: {timeline['peak_occupancy'].max():,.0f}"
-          f"  Ever admitted: {timeline['total_ever_admitted'].iloc[-1]:,.0f}")
+    for d in [1, 2, 3]:
+        tl_d = timeline[timeline["day"] == d]
+        print(f"  Day {d}: peak_festival_a={tl_d['festival_a'].max():,.0f}"
+              f"  ever_admitted_by_eod={tl_d['total_ever_admitted'].iloc[-1]:,.0f}")
 
     plot_day_overview(timeline, zone_tl, scn_a4).savefig(
         "plot1_day_overview.png", dpi=150, bbox_inches="tight")
@@ -1264,20 +1785,14 @@ if __name__ == "__main__":
     plt.close("all")
     print("  → plot1–4 saved")
 
-    # ── 50-rep comparison A1–A4 across all three days ─────────
-    print("\nRunning 50-replication comparison for A1–A4 across 3 days...")
+    # ── 50-rep comparison A1–A4 (each rep = full 3-day run) ───
+    print("\nRunning 50-replication comparison for A1–A4...")
     results, summaries = {}, {}
     for label in ["A1", "A2", "A3", "A4"]:
-        # Weight days: Fri/Sat/Sun each contribute one day of the weekend
-        day_dfs = []
-        for day in [1, 2, 3]:
-            scn = make_alternative(label, day=day)
-            df  = monte_carlo(scn, n_runs=50, seed=2026 + day*1000)
-            day_dfs.append(df)
-        # Average across the three days (equal weight)
-        combined = pd.concat(day_dfs, ignore_index=True)
-        results[label]   = combined
-        summaries[label] = summarize_alternative(combined)
+        scn = make_alternative(label)
+        df  = monte_carlo(scn, n_runs=50, seed=2026)
+        results[label]   = df
+        summaries[label] = summarize_alternative(df)
         s = summaries[label]
         print(f"  {label}: E[uO]={s['E_uO']:,.0f}  E[uA]={s['E_uA']:.1f}"
               f"  feasible={s['frac_feasible']*100:.0f}%"
@@ -1295,7 +1810,7 @@ if __name__ == "__main__":
     cross_results, cross_summaries = {}, {}
     for ft_key in ["camping_sellout", "camping_general", "singleday_sellout", "singleday_general"]:
         scn = make_scenario(ft_key, a_total=55000, t_evac_min=10,
-                            festival_type_key=ft_key, day=2)
+                            festival_type_key=ft_key)
         df  = monte_carlo(scn, n_runs=25, seed=2026)
         cross_results[ft_key]   = df
         cross_summaries[ft_key] = summarize_alternative(df)
@@ -1304,3 +1819,20 @@ if __name__ == "__main__":
         print(f"  {ft_key:<22}: noshow clear={nr['clear']:.1%} rain={nr['rain']:.1%}"
               f"  ever_admitted={s['mean_ever_admitted']:,.0f}"
               f"  E[uO]={s['E_uO']:,.0f}  feasible={s['frac_feasible']*100:.0f}%")
+
+    # ── Planning layer example ─────────────────────────────────────────
+    print("\nRunning planning layer example (MyFestival_2026)...")
+    plan = FestivalPlan(
+        name="MyFestival_2026",
+        zone_areas={"main_stage": 20000, "food_village": 12000, "chill_zone": 8000},
+        entrance_lanes={"main": 20, "secondary": 10},
+        ticket_sales=35000,
+        ticket_price=95.0,
+        n_days=1,
+        t_evac_min=10,
+        is_camping=False,
+        total_budget=300000,
+        n_runs=50,
+    )
+    report = generate_plan(plan)
+    report.print_summary()
